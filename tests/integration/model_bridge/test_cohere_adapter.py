@@ -28,6 +28,17 @@ from transformer_lens.model_bridge.sources import build_bridge_from_module
 MODEL = "trl-internal-testing/tiny-CohereForCausalLM"
 
 
+# Keep this matrix deterministic. The former four-token check allowed a
+# length-sensitive conversion error to remain below the tolerance.
+FORWARD_PARITY_CASES = [
+    pytest.param(torch.tensor([[1, 2, 3, 4]], dtype=torch.long), id="short-4"),
+    pytest.param(
+        torch.tensor([[1, 2, 3, 4] * 8], dtype=torch.long),
+        id="long-32",
+    ),
+]
+
+
 def _tiny_cohere_bridge(logit_scale: float = 0.5) -> TransformerBridge:
     config = CohereConfig(
         vocab_size=32,
@@ -111,7 +122,9 @@ def _process_only_logit_scale(bridge: TransformerBridge) -> None:
 @pytest.fixture(scope="module")
 def cohere_bridge():
     """Load tiny Cohere bridge once per module (no weight processing)."""
-    return TransformerBridge.boot_transformers(MODEL, device="cpu")
+    return TransformerBridge.boot_transformers(
+        MODEL, device="cpu", dtype=torch.float32, attn_implementation="eager"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -122,7 +135,9 @@ def cohere_bridge_processed():
     it automatically. We disable all ProcessWeights options so only the adapter's
     preprocess_weights (logit_scale fold + untie) runs.
     """
-    bridge = TransformerBridge.boot_transformers(MODEL, device="cpu")
+    bridge = TransformerBridge.boot_transformers(
+        MODEL, device="cpu", dtype=torch.float32, attn_implementation="eager"
+    )
     bridge.process_weights(
         fold_ln=False,
         center_writing_weights=False,
@@ -136,7 +151,7 @@ def cohere_bridge_processed():
 @pytest.fixture(scope="module")
 def cohere_hf() -> Any:
     """Load the raw HF model for side-by-side comparisons."""
-    return AutoModelForCausalLM.from_pretrained(MODEL).eval()
+    return AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32).eval()
 
 
 # ---------------------------------------------------------------------------
@@ -232,14 +247,18 @@ class TestCohereForwardEquivalence:
         assert not torch.isnan(output).any()
         assert not torch.isinf(output).any()
 
-    def test_forward_matches_hf(self, cohere_bridge: TransformerBridge, cohere_hf: Any) -> None:
-        """Bridge reconstructs attention in its own forward — logits must still match HF."""
-        tokens = torch.tensor([[1, 2, 3, 4]])
+    @pytest.mark.parametrize("tokens", FORWARD_PARITY_CASES)
+    def test_forward_matches_hf_prompt_matrix(
+        self, tokens: torch.Tensor, cohere_bridge: TransformerBridge, cohere_hf: Any
+    ) -> None:
+        """Require parity on both the legacy probe and a length-sensitive probe."""
         with torch.no_grad():
             bridge_out = cohere_bridge(tokens)
             hf_out = cohere_hf(tokens).logits
         max_diff = (bridge_out - hf_out).abs().max().item()
-        assert max_diff < 1e-4, f"Bridge vs HF max diff = {max_diff:.6f}"
+        assert max_diff <= 1e-4, (
+            f"Bridge vs HF max diff = {max_diff:.6f} for seq_len={tokens.shape[1]}"
+        )
 
 
 # ---------------------------------------------------------------------------
