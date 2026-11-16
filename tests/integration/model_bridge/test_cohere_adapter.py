@@ -378,19 +378,27 @@ class TestCohereLogitScaleEndToEnd:
             ]
         )
 
-        with torch.no_grad():
-            _process_only_logit_scale(bridge)
-            processed_logits, cache = bridge.run_with_cache(tokens)
-            hf_output = reference(tokens, output_hidden_states=True)
-            hf_resid_pre = reference.model.embed_tokens(tokens)
-            hf_ln1 = reference.model.layers[0].input_layernorm(hf_resid_pre)
-            bridge_ln1 = bridge.blocks[0].ln1(cache["blocks.0.hook_resid_pre"])
+        first_layer_outputs = []
 
-        torch.testing.assert_close(processed_logits, hf_output.logits)
+        def capture_first_layer_output(_module, _args, output) -> None:
+            first_layer_outputs.append(output[0] if isinstance(output, tuple) else output)
+
+        capture_handle = reference.model.layers[0].register_forward_hook(capture_first_layer_output)
+        try:
+            with torch.no_grad():
+                _process_only_logit_scale(bridge)
+                processed_logits, cache = bridge.run_with_cache(tokens)
+                hf_logits = reference(tokens).logits
+                hf_resid_pre = reference.model.embed_tokens(tokens)
+                hf_ln1 = reference.model.layers[0].input_layernorm(hf_resid_pre)
+                bridge_ln1 = bridge.blocks[0].ln1(cache["blocks.0.hook_resid_pre"])
+        finally:
+            capture_handle.remove()
+
+        assert len(first_layer_outputs) == 1
+        torch.testing.assert_close(processed_logits, hf_logits)
         torch.testing.assert_close(bridge_ln1, hf_ln1)
-        torch.testing.assert_close(
-            cache["blocks.0.hook_resid_post"], hf_output.hidden_states[1]
-        )
+        torch.testing.assert_close(cache["blocks.0.hook_resid_post"], first_layer_outputs[0])
 
     def test_compatibility_mode_preserves_forward_logits(self) -> None:
         bridge = _tiny_cohere_bridge()
