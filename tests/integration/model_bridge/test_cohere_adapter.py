@@ -339,20 +339,58 @@ class TestCohereLogitScaleEndToEnd:
 
     def test_process_weights_preserves_forward_logits(self) -> None:
         bridge = _tiny_cohere_bridge()
+        # Keep an untouched HF model: process_weights mutates the bridge's
+        # original model to fold logit_scale into lm_head.
+        reference = copy.deepcopy(bridge.original_model).eval()
         tokens = torch.tensor([[1, 2, 3, 4]])
         raw_embed = bridge.embed.W_E.detach().clone()
         raw_unembed = bridge.unembed.original_component.weight.detach().clone()
 
         with torch.no_grad():
             raw_logits = bridge(tokens)
+            reference_logits = reference(tokens).logits
             _process_only_logit_scale(bridge)
             processed_logits = bridge(tokens)
 
+        torch.testing.assert_close(raw_logits, reference_logits)
+        torch.testing.assert_close(processed_logits, reference_logits)
         torch.testing.assert_close(processed_logits, raw_logits)
         torch.testing.assert_close(bridge.embed.W_E, raw_embed)
         torch.testing.assert_close(bridge.unembed.original_component.weight, raw_unembed * 0.5)
         assert bridge.original_model.logit_scale == 1.0
         assert bridge.cfg.logit_scale == 0.5
+
+    def test_processed_weights_match_hf_on_long_prompt_and_intermediates(self) -> None:
+        """A processed bridge retains HF parity beyond the short smoke input.
+
+        This targets drift introduced while folding weights: compare a deterministic
+        24-token input after process_weights, then pin the first normalisation
+        boundary and first block residual to an untouched HF reference.
+        """
+        bridge = _tiny_cohere_bridge()
+        reference = copy.deepcopy(bridge.original_model).eval()
+        tokens = torch.tensor(
+            [
+                [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23,
+                 25, 27, 29, 31, 2, 4, 6, 8, 10, 12, 14, 16],
+                [16, 14, 12, 10, 8, 6, 4, 2, 31, 29, 27, 25,
+                 23, 21, 19, 17, 15, 13, 11, 9, 7, 5, 3, 1],
+            ]
+        )
+
+        with torch.no_grad():
+            _process_only_logit_scale(bridge)
+            processed_logits, cache = bridge.run_with_cache(tokens)
+            hf_output = reference(tokens, output_hidden_states=True)
+            hf_resid_pre = reference.model.embed_tokens(tokens)
+            hf_ln1 = reference.model.layers[0].input_layernorm(hf_resid_pre)
+            bridge_ln1 = bridge.blocks[0].ln1(cache["blocks.0.hook_resid_pre"])
+
+        torch.testing.assert_close(processed_logits, hf_output.logits)
+        torch.testing.assert_close(bridge_ln1, hf_ln1)
+        torch.testing.assert_close(
+            cache["blocks.0.hook_resid_post"], hf_output.hidden_states[1]
+        )
 
     def test_compatibility_mode_preserves_forward_logits(self) -> None:
         bridge = _tiny_cohere_bridge()
